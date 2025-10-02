@@ -230,6 +230,7 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
       email: order.email || order.customer?.email || ""
     },
     items
+    confirm: false
   };
 
   console.log("🚚 Printful payload:", JSON.stringify(payload, null, 2));
