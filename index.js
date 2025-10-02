@@ -219,6 +219,7 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
 
   const payload = {
     external_id: String(order.id),
+    confirm: false,
     recipient: {
       name: `${order.shipping_address?.first_name || order.customer?.first_name || ""} ${order.shipping_address?.last_name || order.customer?.last_name || ""}`.trim(),
       address1: order.shipping_address?.address1 || "",
