@@ -255,22 +255,33 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
 }
 
 // ---------------- Webhook route ----------------
+const processedOrders = new Set(); // in-memory cache to prevent duplicates
+
 app.post("/webhook/orders_create", async (req, res) => {
   try {
     const order = req.body;
     console.log("✅ Received Shopify order:", order.id, "| line_items:", (order.line_items || []).length);
 
-    // Debug: show line items minimal fields for easier traceability
+    // 🔒 Prevent duplicate processing
+    if (processedOrders.has(order.id)) {
+      console.log(`⚠️ Duplicate webhook ignored for order ${order.id}`);
+      return res.status(200).send("Already processed");
+    }
+
+    // Debug: show line items minimal fields
     (order.line_items || []).forEach((li, idx) => {
       console.log(`  item[${idx}] title="${li.title}" sku="${li.sku}" variant_id=${li.variant_id} qty=${li.quantity}`);
     });
 
-    // Find QR text (from any line item property 'QR Text')
+    // Find QR text
     let qrText = null;
     for (const li of order.line_items || []) {
       if (li.properties) {
         const prop = li.properties.find((p) => (p.name || "").toLowerCase() === "qr text");
-        if (prop && prop.value) { qrText = prop.value; break; }
+        if (prop && prop.value) {
+          qrText = prop.value;
+          break;
+        }
       }
     }
 
@@ -299,10 +310,14 @@ app.post("/webhook/orders_create", async (req, res) => {
     try {
       const pfResult = await createOrUpdatePrintfulOrder(order, imageUrl);
       if (pfResult && pfResult.skipped) {
-        // we chose to skip creating order if no mapped items — respond 200 to avoid retries but log
         return res.status(200).send("No mapped items; skipped Printful creation");
       }
+
       console.log("📦 Printful API Response:", pfResult);
+
+      // ✅ Mark order as processed after success
+      processedOrders.add(order.id);
+
       return res.status(200).send("Processed and sent to Printful");
     } catch (pfErr) {
       console.error("❌ Printful order creation failed:", pfErr.message || pfErr);
