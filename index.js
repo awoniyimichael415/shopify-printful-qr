@@ -292,8 +292,11 @@ app.post("/webhook/orders_create", async (req, res) => {
     }
     console.log("📝 QR Text:", qrText);
 
-    // Generate QR image base64
-    const dataUrl = await QRCode.toDataURL(qrText);
+// Recreate the QR payload exactly like Shopify
+    const qrContent = `${qrText}\nVisit: https://yosoy1.com`;
+
+// Generate QR code
+    const dataUrl = await QRCode.toDataURL(qrContent);
     const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, "");
     console.log("🖼️ QR base64 length:", base64.length);
 
