@@ -195,24 +195,38 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
 
     // Try SKU first, then variant_id mapping (both maps now hold sync_variant_id)
     const mapped = variantFromSku || variantFromExternal;
-    console.log("🔎 SKU lookup:", sku || "-", "→", variantFromSku ?? "(no sku mapping)", "|",
-                "variant_id lookup:", li.variant_id ?? "-", "→", variantFromExternal ?? "(no external mapping)");
+    console.log(
+      "🔎 SKU lookup:",
+      sku || "-",
+      "→",
+      variantFromSku ?? "(no sku mapping)",
+      "|",
+      "variant_id lookup:",
+      li.variant_id ?? "-",
+      "→",
+      variantFromExternal ?? "(no external mapping)"
+    );
 
     if (!mapped) {
-      console.warn(`⚠️ No Printful mapping for item (sku=${sku}, variant_id=${li.variant_id}). Skipping this line item.`);
+      console.warn(
+        `⚠️ No Printful mapping for item (sku=${sku}, variant_id=${li.variant_id}). Skipping this line item.`
+      );
       continue; // skip items we cannot map (you said no fallback)
     }
 
+    // ✅ Updated section begins here
     items.push({
       quantity: li.quantity || 1,
-      // ✅ Use sync_variant_id (numeric) — Printful expects this for synced store products
       sync_variant_id: Number(mapped),
-      files: [{ url: imageUrl, type: "back" }]
+      files: [
+        { type: "default" }, // preserve front design
+        { type: "back", placement: "back", url: imageUrl } // inject QR as back print
+      ]
     });
+    // ✅ Updated section ends here
   }
 
   if (!items.length) {
-    // don't attempt Printful order creation if no mapped items
     console.warn("⚠️ No mapped items in order — skipping Printful call.");
     return { skipped: true, reason: "no_mapped_items" };
   }
@@ -235,7 +249,6 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
 
   console.log("🚚 Printful payload:", JSON.stringify(payload, null, 2));
 
-  // Idempotent upsert: PUT /orders/@external_id
   const url = `${PRINTFUL_API}/orders/@${payload.external_id}`;
   const resp = await fetch(url, {
     method: "PUT",
@@ -254,6 +267,7 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
 
   return data;
 }
+
 
 // ---------------- Webhook route ----------------
 const processedOrders = new Set(); // in-memory cache to prevent duplicates
