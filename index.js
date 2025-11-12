@@ -1,4 +1,4 @@
-// index.js (drop-in replacement)
+// index.js (updated for Printful API v2 "placements")
 import express from "express";
 import crypto from "crypto";
 import bodyParser from "body-parser";
@@ -35,29 +35,24 @@ app.use(express.json({
     try {
       verifyShopifyWebhook(req, res, buf);
     } catch (e) {
-      // Throw so express returns 400/401 to caller
       throw e;
     }
   }
 }));
 
 // ---------------- maps + persistence ----------------
-// we'll store two maps in skuMap.json: { skuMap: {...}, externalMap: {...} }
-// NOTE: skuMap and externalMap now store Printful **sync_variant_id** (numeric)
-let skuMap = {};        // SKU -> printful_sync_variant_id
-let externalMap = {};   // external_id (Shopify variant id as string) -> printful_sync_variant_id
+let skuMap = {};
+let externalMap = {};
 
 function loadSkuMapFromFile() {
   try {
     if (fs.existsSync(SKU_MAP_FILE)) {
       const raw = fs.readFileSync(SKU_MAP_FILE, "utf8");
       const parsed = JSON.parse(raw);
-      // Backwards compatible: allow old format where file was flat map
       if (parsed && parsed.skuMap && parsed.externalMap) {
         skuMap = parsed.skuMap || {};
         externalMap = parsed.externalMap || {};
       } else {
-        // old shape: entire file was skuMap only
         skuMap = parsed || {};
         externalMap = {};
       }
@@ -77,10 +72,7 @@ function saveSkuMapToFileIfChanged(newSkuMap, newExternalMap) {
     const newJson = JSON.stringify(newObj, null, 2);
     if (fs.existsSync(SKU_MAP_FILE)) {
       const oldJson = fs.readFileSync(SKU_MAP_FILE, "utf8");
-      if (oldJson === newJson) {
-        // no change → avoid rewriting file (prevents nodemon restarts)
-        return;
-      }
+      if (oldJson === newJson) return;
     }
     fs.writeFileSync(SKU_MAP_FILE, newJson);
     console.log(`✅ Saved skuMap.json (sku keys: ${Object.keys(newSkuMap).length}, external keys: ${Object.keys(newExternalMap).length})`);
@@ -89,10 +81,10 @@ function saveSkuMapToFileIfChanged(newSkuMap, newExternalMap) {
   }
 }
 
-// ---------------- build maps from Printful (/sync/products) ----------------
+// ---------------- build maps from Printful ----------------
 async function buildSkuMaps() {
   if (!PRINTFUL_TOKEN) throw new Error("PRINTFUL_TOKEN not set in .env");
-  console.log("🔄 Fetching Printful sync catalog (this runs in background)...");
+  console.log("🔄 Fetching Printful sync catalog...");
 
   const headers = { Authorization: `Bearer ${PRINTFUL_TOKEN}` };
   let offset = 0;
@@ -111,7 +103,6 @@ async function buildSkuMaps() {
 
     const products = data.result || [];
     for (const p of products) {
-      // fetch product details (sync_variants)
       const pr = await fetch(`${PRINTFUL_API}/sync/products/${p.id}`, { headers });
       const prData = await pr.json();
       if (!pr.ok) {
@@ -120,23 +111,11 @@ async function buildSkuMaps() {
       }
       const variants = prData.result?.sync_variants || [];
       for (const v of variants) {
-        // IMPORTANT: use Printful **sync variant id** (v.id or v.sync_variant_id) — this is what we must send as sync_variant_id in orders
         const syncIdRaw = (v.id ?? v.sync_variant_id ?? null);
         const syncId = syncIdRaw != null ? Number(syncIdRaw) : null;
-        if (!syncId || Number.isNaN(syncId)) {
-          // If sync id not present, skip (log for debug)
-          console.warn("⚠️ skipping variant missing numeric sync id:", JSON.stringify({ sku: v.sku, variant_id: v.variant_id, external_id: v.external_id }).slice(0,200));
-          continue;
-        }
-
-        // v.sku (string like '7570467_11576') -> numeric sync_variant_id (Printful)
-        if (v.sku) {
-          newSkuMap[v.sku] = syncId;
-        }
-        // v.external_id is Shopify's variant id (string / numeric). store as string key.
-        if (v.external_id != null) {
-          newExternalMap[String(v.external_id)] = syncId;
-        }
+        if (!syncId || Number.isNaN(syncId)) continue;
+        if (v.sku) newSkuMap[v.sku] = syncId;
+        if (v.external_id != null) newExternalMap[String(v.external_id)] = syncId;
       }
     }
 
@@ -144,7 +123,6 @@ async function buildSkuMaps() {
     offset += limit;
   }
 
-  // swap into memory and persist only if changed
   if (JSON.stringify(skuMap) !== JSON.stringify(newSkuMap) || JSON.stringify(externalMap) !== JSON.stringify(newExternalMap)) {
     skuMap = newSkuMap;
     externalMap = newExternalMap;
@@ -153,7 +131,6 @@ async function buildSkuMaps() {
     console.log("ℹ️ SKU maps unchanged — no file write");
   }
 
-  // debug: show first 8 entries (sync_variant ids)
   const sample = Object.entries(skuMap).slice(0, 8);
   if (sample.length) {
     console.log("🔎 Sample SKU -> sync_variant_id (first 8):");
@@ -166,15 +143,11 @@ async function buildSkuMaps() {
 // ---------------- ImgBB upload ----------------
 async function uploadToImgBB(base64Image) {
   if (!IMGBB_API_KEY) throw new Error("IMGBB_API_KEY not set in .env");
-  // ImgBB expects raw base64 string (no data:... prefix)
   const payload = new URLSearchParams();
   payload.append("image", base64Image);
 
   const url = `${IMGBB_API}?key=${encodeURIComponent(IMGBB_API_KEY)}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    body: payload,
-  });
+  const resp = await fetch(url, { method: "POST", body: payload });
   const data = await resp.json();
   if (!resp.ok || data.success !== true) {
     console.error("❌ ImgBB failed:", data);
@@ -183,7 +156,7 @@ async function uploadToImgBB(base64Image) {
   return data.data?.url || data.data?.display_url || null;
 }
 
-// ---------------- Create Printful order (idempotent via PUT /orders/@external_id) ----------------
+// ---------------- Create/Update Printful order ----------------
 async function createOrUpdatePrintfulOrder(order, imageUrl) {
   if (!PRINTFUL_TOKEN) throw new Error("PRINTFUL_TOKEN not set in .env");
 
@@ -192,38 +165,45 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
     const sku = (li.sku || "").toString();
     const variantFromSku = sku ? skuMap[sku] : undefined;
     const variantFromExternal = li.variant_id ? externalMap[String(li.variant_id)] : undefined;
-
-    // Try SKU first, then variant_id mapping (both maps now hold sync_variant_id)
     const mapped = variantFromSku || variantFromExternal;
+
     console.log(
       "🔎 SKU lookup:",
       sku || "-",
       "→",
       variantFromSku ?? "(no sku mapping)",
-      "|",
-      "variant_id lookup:",
+      "| variant_id lookup:",
       li.variant_id ?? "-",
       "→",
       variantFromExternal ?? "(no external mapping)"
     );
 
     if (!mapped) {
-      console.warn(
-        `⚠️ No Printful mapping for item (sku=${sku}, variant_id=${li.variant_id}). Skipping this line item.`
-      );
-      continue; // skip items we cannot map (you said no fallback)
+      console.warn(`⚠️ No Printful mapping for item (sku=${sku}, variant_id=${li.variant_id}). Skipping.`);
+      continue;
     }
 
-    // ✅ Updated section begins here
+    // ✅ Updated for Printful API v2
     items.push({
       quantity: li.quantity || 1,
       sync_variant_id: Number(mapped),
-      files: [
-        { type: "default" }, // preserve front design
-        { type: "back", placement: "back", url: imageUrl } // inject QR as back print
+      placements: [
+        {
+          placement: "front",
+          technique: "dtg",
+          layers: [
+            { type: "file", url: "default" } // keep front print
+          ]
+        },
+        {
+          placement: "back",
+          technique: "dtg",
+          layers: [
+            { type: "file", url: imageUrl } // QR code on back
+          ]
+        }
       ]
     });
-    // ✅ Updated section ends here
   }
 
   if (!items.length) {
@@ -268,27 +248,23 @@ async function createOrUpdatePrintfulOrder(order, imageUrl) {
   return data;
 }
 
-
-// ---------------- Webhook route ----------------
-const processedOrders = new Set(); // in-memory cache to prevent duplicates
+// ---------------- Webhook handler ----------------
+const processedOrders = new Set();
 
 app.post("/webhook/orders_create", async (req, res) => {
   try {
     const order = req.body;
     console.log("✅ Received Shopify order:", order.id, "| line_items:", (order.line_items || []).length);
 
-    // 🔒 Prevent duplicate processing
     if (processedOrders.has(order.id)) {
       console.log(`⚠️ Duplicate webhook ignored for order ${order.id}`);
       return res.status(200).send("Already processed");
     }
 
-    // Debug: show line items minimal fields
     (order.line_items || []).forEach((li, idx) => {
-      console.log(`  item[${idx}] title="${li.title}" sku="${li.sku}" variant_id=${li.variant_id} qty=${li.quantity}`);
+      console.log(`  item[${idx}] "${li.title}" sku="${li.sku}" variant_id=${li.variant_id} qty=${li.quantity}`);
     });
 
-    // Find QR text
     let qrText = null;
     for (const li of order.line_items || []) {
       if (li.properties) {
@@ -301,20 +277,16 @@ app.post("/webhook/orders_create", async (req, res) => {
     }
 
     if (!qrText) {
-      console.log("⚠️ No 'QR Text' found — skipping Printful creation for this order.");
+      console.log("⚠️ No 'QR Text' found — skipping Printful creation.");
       return res.status(200).send("No QR Text");
     }
     console.log("📝 QR Text:", qrText);
 
-// Recreate the QR payload exactly like Shopify
-    const qrContent = `${qrText}\nVisit: https://yosoy1.com`;
-
-// Generate QR code
+    const qrContent = `${qrText}\nVisit: yosoy1.com`;
     const dataUrl = await QRCode.toDataURL(qrContent);
     const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, "");
     console.log("🖼️ QR base64 length:", base64.length);
 
-    // Upload to ImgBB
     let imageUrl;
     try {
       imageUrl = await uploadToImgBB(base64);
@@ -324,7 +296,6 @@ app.post("/webhook/orders_create", async (req, res) => {
       return res.status(500).send("ImgBB upload failed");
     }
 
-    // Create / update Printful order
     try {
       const pfResult = await createOrUpdatePrintfulOrder(order, imageUrl);
       if (pfResult && pfResult.skipped) {
@@ -332,23 +303,19 @@ app.post("/webhook/orders_create", async (req, res) => {
       }
 
       console.log("📦 Printful API Response:", pfResult);
-
-      // ✅ Mark order as processed after success
       processedOrders.add(order.id);
-
       return res.status(200).send("Processed and sent to Printful");
     } catch (pfErr) {
       console.error("❌ Printful order creation failed:", pfErr.message || pfErr);
       return res.status(500).send("Printful order failed");
     }
-
   } catch (err) {
     console.error("❌ Webhook handler error:", err.message || err);
     return res.status(500).send("Server error");
   }
 });
 
-// ---------------- Admin: rebuild map on-demand (optional, protected by token query param if you set ADMIN_TOKEN) ----------------
+// ---------------- Admin + Startup ----------------
 app.post("/admin/rebuild-sku-map", async (req, res) => {
   try {
     await buildSkuMaps();
@@ -359,19 +326,17 @@ app.post("/admin/rebuild-sku-map", async (req, res) => {
   }
 });
 
-// ---------------- Startup: load cache then start listening, then refresh maps in background ----------------
 loadSkuMapFromFile();
 
 app.listen(PORT, async () => {
   console.log(`🚀 Server listening on port ${PORT}`);
-  // build maps in background without blocking server start
   try {
     await buildSkuMaps();
     console.log("✅ SKU maps ready.");
   } catch (err) {
-    console.error("⚠️ buildSkuMaps failed (continuing with loaded map):", err.message || err);
+    console.error("⚠️ buildSkuMaps failed:", err.message || err);
   }
   app.get("/", (req, res) => {
-  res.send("🚀 The Back Print QR Mockup Server is running!");
-});
+    res.send("🚀 The Back Print QR Mockup Server is running!");
+  });
 });
